@@ -1,0 +1,632 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+local VirtualUser = game:GetService("VirtualUser")
+
+local player = Players.LocalPlayer
+player.Idled:Connect(function()
+    VirtualUser:CaptureController()
+    VirtualUser:ClickButton2(Vector2.new())
+end)
+
+do
+    local Lighting = game:GetService("Lighting")
+    local Terrain = workspace:FindFirstChildOfClass("Terrain")
+    pcall(function()
+        settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+    end)
+    
+    Lighting.GlobalShadows = false
+    Lighting.Brightness = 1
+    Lighting.EnvironmentDiffuseScale = 0
+    Lighting.EnvironmentSpecularScale = 0
+    Lighting.FogEnd = 9e9
+
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("BasePart") then
+            obj.Material = Enum.Material.Plastic
+            obj.Reflectance = 0
+        elseif obj:IsA("PostEffect") or obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Beam") then
+            obj.Enabled = false
+        end
+    end
+
+    if Terrain then
+        Terrain.WaterWaveSize = 0
+        Terrain.WaterWaveSpeed = 0
+        Terrain.WaterReflectance = 0
+        Terrain.WaterTransparency = 1
+    end
+end
+local gui = Instance.new("ScreenGui")
+gui.Name = "StuckWarningGui"
+gui.ResetOnSpawn = false
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local label = Instance.new("TextLabel")
+label.Size = UDim2.fromScale(1, 1)
+label.BackgroundTransparency = 1
+label.Text = "CHARACTER STUCK\nRETURNING TO NEAREST POSITION"
+label.TextColor3 = Color3.fromRGB(255, 60, 60)
+label.TextStrokeTransparency = 0
+label.TextScaled = false
+label.TextSize = 36
+label.TextWrapped = true
+label.TextYAlignment = Enum.TextYAlignment.Center
+label.TextXAlignment = Enum.TextXAlignment.Center
+label.Font = Enum.Font.GothamBlack
+label.Visible = false
+label.Parent = gui
+local FILE_URL = "https://raw.githubusercontent.com/S-J-090/booga-booga-reborn/refs/heads/main/Shift%20Tween.json"
+local ShiftConfig = _G.ShiftConfig
+local playerName = player.Name
+
+if not ShiftConfig and playerName ~= "Shift_JM" then
+    error("ShiftConfig not loaded! This script must be run via the main loader.")
+end
+
+local SPEED = (ShiftConfig and tonumber(ShiftConfig.SPEED)) or 19
+local FAST_SPEED = (ShiftConfig and tonumber(ShiftConfig.FAST_SPEED)) or 20
+local STUCK_TIME_REQUIRED = (ShiftConfig and tonumber(ShiftConfig.STUCK_TIME_REQUIRED)) or 10
+
+local TweenSpeedRanges = {
+	{5, 7},
+	{8, 12},
+	{14, 16},
+	{18, 29},
+	{32, 42},
+	{44, 55},
+	{57, 79},
+	{80, 87},
+	{100, 104},
+	{110, 112},
+	{117, 122},
+	{128, 131},
+	{134, 136},
+	{153, 159},
+	{161, 168},
+	{170, 172},
+	{174, 186},
+	{189, 191},
+	{203, 219},
+}
+local ARRIVE_DISTANCE = 1
+local LERP_ALPHA = 0.18
+
+local GOLD_RANGE = 18
+local GOLD_RANGE_SQ = GOLD_RANGE ^ 2
+local goldWaitStart = 0
+local goldWaiting = false
+local goldHealthRef = nil
+
+local GoldScanPos = {
+	1,
+	3,
+	5,
+	13,
+	17,
+	31,
+	43,
+	54,
+	55,
+	56,
+	70,
+	79,
+	92,
+	104,
+	123,
+	133,
+	134,
+	155,
+	160,
+	169,
+	172,
+	178,
+	193,
+}
+
+local GoldScanSet = {}
+for _, pos in ipairs(GoldScanPos) do
+	GoldScanSet[pos] = true
+end
+
+
+
+local paused = false
+local index = 1
+local waypoints = {}
+local stuckTimer = 0
+local isStuckHandling = false
+local triedWaypoints = {}   
+local stuckRetryCount = 0  
+local MAX_STUCK_RETRIES = 15 
+local stuckTargetIndex = nil
+local POSITION_STUCK_THRESHOLD = 2
+local stuckTargetPos = nil
+local stuckHandlingStartTime = 0
+local GOLD_WAIT_TIMEOUT = 5
+local STUCK_RETRY_TIMEOUT = math.max(1, STUCK_TIME_REQUIRED - 3)
+local excludedWaypointIndex = nil
+local deathResumeTime = nil 
+local lastPos
+local Resources = workspace:WaitForChild("Resources")
+local character, humanoid, root = nil, nil, nil
+
+local bv = Instance.new("BodyVelocity")
+bv.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+bv.P = 9000
+bv.Velocity = Vector3.zero
+local goldNodes = {}
+local directionLine = nil
+local function updateDirectionLine(targetPos, color)
+	if not root or not targetPos then
+		if directionLine then
+			directionLine:Destroy()
+			directionLine = nil
+		end
+		return
+	end
+	
+	local charPos = root.Position
+	local delta = targetPos - charPos
+	local distance = delta.Magnitude
+	
+	if distance < 0.1 then
+		if directionLine then
+			directionLine:Destroy()
+			directionLine = nil
+		end
+		return
+	end
+	
+	if not directionLine or not directionLine.Parent then
+		directionLine = Instance.new("Part")
+		directionLine.Name = "DirectionLine"
+		directionLine.Anchored = true
+		directionLine.CanCollide = false
+		directionLine.CastShadow = false
+		directionLine.Transparency = 0.1
+		directionLine.Color = color or Color3.fromRGB(0, 255, 100)
+		directionLine.Material = Enum.Material.Neon
+		directionLine.Size = Vector3.new(0.25, 0.25, 1)
+		directionLine.Parent = workspace
+	end
+	
+	local midPoint = charPos + delta * 0.5
+	directionLine.Position = midPoint
+	directionLine.Size = Vector3.new(0.20, 0.20, math.max(1, distance))
+	directionLine.CFrame = CFrame.new(midPoint, midPoint + delta.Unit)
+end
+
+local function hideDirectionLine()
+	if directionLine then
+		directionLine:Destroy()
+		directionLine = nil
+	end
+end
+local function deleteUnwantedObjects()
+    local keywords = {"mound", "rock", "boat", "treasure", "meteor"}
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if not obj:IsA("Model") and not obj:IsA("BasePart") and not obj:IsA("Folder") then 
+            continue 
+        end
+
+        local name = obj.Name
+        local lowerName = string.lower(name)
+        if obj.Parent == Resources and name ~= "Gold Node" then
+            obj:Destroy()
+            continue
+        end
+        if name == "Critters" then
+            obj:Destroy()
+            continue
+        end
+        if name == "Cave Spikes" then
+            obj:Destroy()
+            continue
+        end
+
+        for _, keyword in ipairs(keywords) do
+            if string.find(lowerName, keyword, 1, true) and name ~= "Gold Node" then
+                obj:Destroy()
+                break
+            end
+        end
+    end
+end
+deleteUnwantedObjects()
+task.spawn(function()
+	task.wait(10)
+	for _, obj in ipairs(workspace:GetDescendants()) do
+		if obj:IsA("Model") and (obj.Name == "Campfire" or obj.Name == "Plant Box") then
+			for _, part in ipairs(obj:GetDescendants()) do
+				if part:IsA("BasePart") then
+					part.CanCollide = false
+				end
+			end
+		end
+	end
+end)
+local function showMessage(text, duration)
+    label.Text = text
+    label.Visible = true
+    task.delay(duration or 3, function()
+        label.Visible = false
+    end)
+end
+local function trackGold(node)
+	if node:IsA("Model") and node.Name == "Gold Node" then
+		local part = node.PrimaryPart or node:FindFirstChildWhichIsA("BasePart")
+		local healthValue = node:FindFirstChild("Health")
+		if part and healthValue and healthValue:IsA("IntValue") then
+			goldNodes[node] = { part = part, health = healthValue }
+			node.Destroying:Once(function()
+				goldNodes[node] = nil
+			end)
+		end
+	end
+end
+
+for _, n in ipairs(Resources:GetChildren()) do
+	trackGold(n)
+end
+Resources.ChildAdded:Connect(trackGold)
+
+local function isNearSignificantGold()
+	local p = root.Position
+	for _, data in pairs(goldNodes) do
+		if data and data.part and data.health then
+			local part = data.part
+			local health = data.health
+			if not part or not part.Parent or not health or not health.Parent then
+				continue
+			end
+			if (part.Position - p).Magnitude^2 <= GOLD_RANGE_SQ then
+				if health.Value >= 10 then
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+local function getNearbyGoldNode()
+	local p = root.Position
+	for _, data in pairs(goldNodes) do
+		if data.part and data.health and data.part.Parent and data.health.Parent then
+			if (data.part.Position - p).Magnitude^2 <= GOLD_RANGE_SQ then
+				return data.health
+			end
+		end
+	end
+	return nil
+end
+local function setupCharacter(char)
+    if bv.Parent then
+        bv.Parent = nil
+		hideDirectionLine()
+    end
+    
+    character = char
+    humanoid = char:WaitForChild("Humanoid")
+    root = char:WaitForChild("HumanoidRootPart")
+    bv.Parent = root
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.Climbing, false)
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.Swimming, false)
+    stuckTimer = 0
+    isStuckHandling = false
+    lastPos = root.Position
+	goldWaiting = false
+    goldHealthRef = nil
+    goldWaitStart = 0
+end
+setupCharacter(player.Character or player.CharacterAdded:Wait())
+
+player.CharacterAdded:Connect(setupCharacter)
+
+
+local function getCurrentSpeed()
+	for _, range in ipairs(TweenSpeedRanges) do
+		if index >= range[1] and index <= range[2] then
+			return FAST_SPEED
+		end
+	end
+	return SPEED
+end
+
+
+local success, response = pcall(game.HttpGet, game, FILE_URL)
+
+if not success then
+	warn("Failed to fetch waypoint file from GitHub:", response)
+	return
+end
+
+local data
+local decodeSuccess, decodeError = pcall(function()
+	data = HttpService:JSONDecode(response)
+end)
+
+if not decodeSuccess or not data or not data.positions then
+	warn("Failed to decode waypoint JSON")
+	return
+end
+
+for i, p in ipairs(data.positions) do
+	waypoints[i] = Vector3.new(p.X, p.Y, p.Z)
+end
+
+
+local function findNearestWaypointIndex(pos, excludeIndex)
+	local bestIndex = 1
+	local bestDist = math.huge
+	for i = 1, #waypoints do
+		if i == excludeIndex then continue end 
+		local d = (waypoints[i] - pos).Magnitude
+		if d < bestDist then
+			bestDist = d
+			bestIndex = i
+		end
+	end
+	return bestIndex
+end
+local function showStuckWarning()
+	label.Visible = true
+	task.delay(5, function()
+		label.Visible = false
+	end)
+end
+
+local function handleStuck()
+    if isStuckHandling then return end
+    isStuckHandling = true
+    showMessage("STUCK! Finding waypoint...", 3)
+    humanoid.Jump = true
+    
+    triedWaypoints = {}
+    stuckRetryCount = 0
+    
+    local candidateIndex = findNearestWaypointIndex(root.Position)
+    stuckTargetIndex = candidateIndex
+    stuckTargetPos = waypoints[candidateIndex]
+    stuckHandlingStartTime = tick()
+    table.insert(triedWaypoints, candidateIndex)
+    excludedWaypointIndex = candidateIndex
+end
+
+local function enableForces()
+	bv.Parent = root
+end
+
+local function disableForces()
+	bv.Parent = nil
+end
+
+UserInputService.InputBegan:Connect(function(input, gp)
+	if gp then return end
+
+	if input.KeyCode == Enum.KeyCode.RightAlt then
+		paused = not paused
+		if paused then
+			disableForces()
+		else
+			index = 1
+			enableForces()
+		end
+	end
+
+	if input.KeyCode == Enum.KeyCode.LeftAlt then
+		index = findNearestWaypointIndex(root.Position)
+		paused = false
+		enableForces()
+		stuckTimer = 0
+	end
+end)
+
+
+RunService.Heartbeat:Connect(function(dt)
+    if humanoid and humanoid.Parent and humanoid.Health <= 0 then
+        if deathResumeTime == nil then
+            paused = true
+            disableForces()
+            deathResumeTime = tick() + 20
+            warn("Character died. Pausing tween. Will resume from start in 20 seconds.")
+        end
+    end
+
+    if deathResumeTime and tick() >= deathResumeTime then
+        index = 1
+        paused = false
+	goldWaiting = false
+    goldHealthRef = nil
+    goldWaitStart = 0
+        if root and root.Parent and humanoid and humanoid.Health > 0 then
+            enableForces()
+        end
+        deathResumeTime = nil
+        warn("Tween resumed from start after death timer.")
+    end
+    if not root or not root.Parent or not humanoid or humanoid.Health <= 0 then
+        return 
+    end
+	if paused then return end
+
+	local currentPos = root.Position
+	local movedDist = (currentPos - lastPos).Magnitude
+
+	if movedDist < POSITION_STUCK_THRESHOLD then
+		stuckTimer += dt
+		if stuckTimer >= STUCK_TIME_REQUIRED then
+			handleStuck()
+			lastPos = root.Position
+			stuckTimer = 0
+		end
+	else
+		stuckTimer = 0
+		lastPos = currentPos
+	end
+
+
+if isStuckHandling then
+    local currentMovedDist = (root.Position - lastPos).Magnitude
+    if stuckTargetPos then
+        updateDirectionLine(stuckTargetPos, Color3.fromRGB(255, 60, 60))
+    end
+    
+    if currentMovedDist >= POSITION_STUCK_THRESHOLD then 
+        isStuckHandling = false
+        hideDirectionLine()
+        stuckTargetPos = nil
+        stuckTargetIndex = nil 
+        label.Visible = false
+        triedWaypoints = {}
+        stuckRetryCount = 0
+        stuckTimer = 0
+        lastPos = root.Position
+        showMessage("Unstuck after " .. stuckRetryCount .. " retries", 2)
+    else
+        if stuckTargetPos then
+            local distToTarget = (root.Position - stuckTargetPos).Magnitude
+
+            if distToTarget < ARRIVE_DISTANCE then
+                index = stuckTargetIndex
+                
+                isStuckHandling = false
+                hideDirectionLine()
+                stuckTargetPos = nil
+                stuckTargetIndex = nil
+                label.Visible = false
+                triedWaypoints = {}
+                stuckRetryCount = 0
+                stuckTimer = 0
+                lastPos = root.Position
+                showMessage("Resuming path from WP " .. index, 2)
+                return 
+            else
+                local delta = stuckTargetPos - root.Position
+                local dir = delta.Magnitude > 0 and delta.Unit or Vector3.zero
+                local speed = getCurrentSpeed() 
+                local desiredVel = dir * speed
+
+                local heightDiff = stuckTargetPos.Y - root.Position.Y
+                if heightDiff > 0 then
+                    desiredVel += Vector3.new(0, math.clamp(heightDiff * 1.5, 0, 15), 0)
+                end
+
+                bv.Velocity = bv.Velocity:Lerp(desiredVel, LERP_ALPHA)
+                if tick() - stuckHandlingStartTime >= STUCK_RETRY_TIMEOUT then
+                    local newIndex = nil
+                    local bestDist = math.huge
+                    
+                    for i = 1, #waypoints do
+                        local alreadyTried = false
+                        for _, tried in ipairs(triedWaypoints) do
+                            if i == tried then
+                                alreadyTried = true
+                                break
+                            end
+                        end
+                        if alreadyTried then continue end
+                        
+                        local d = (waypoints[i] - root.Position).Magnitude
+                        if d < bestDist then
+                            bestDist = d
+                            newIndex = i
+                        end
+                    end
+                    
+                    if newIndex and waypoints[newIndex] and stuckRetryCount < MAX_STUCK_RETRIES then
+                        stuckTargetIndex = newIndex 
+                        stuckTargetPos = waypoints[newIndex]
+                        
+                        stuckHandlingStartTime = tick()
+                        table.insert(triedWaypoints, newIndex)
+                        stuckRetryCount += 1
+                        showMessage("Retry " .. stuckRetryCount .. " - Moving to WP " .. newIndex, 2)
+                    else
+                        showMessage("Fallback - resetting to WP 1", 3)
+                        index = 1
+                        isStuckHandling = false
+                        hideDirectionLine()
+                        stuckTargetPos = nil
+                        stuckTargetIndex = nil
+                        label.Visible = false
+                        triedWaypoints = {}
+                        stuckRetryCount = 0
+                    end
+                end
+            end
+        end
+    end
+    
+    if isStuckHandling and stuckTargetPos then
+        return
+    end
+end
+
+	local target = waypoints[index]
+	if not target then return end
+updateDirectionLine(target, Color3.fromRGB(0, 255, 100))
+	local pos = root.Position
+	local delta = target - pos
+	local dist = delta.Magnitude
+
+if dist < ARRIVE_DISTANCE then
+    if GoldScanSet[index] then
+        if not goldWaiting then
+            local targetHealth = getNearbyGoldNode()
+            if targetHealth and targetHealth.Value > 60 then
+                goldWaiting = true
+                goldWaitStart = tick()
+                goldHealthRef = targetHealth
+                bv.Velocity = Vector3.zero
+                
+                local connection
+                connection = targetHealth.Changed:Connect(function(newHealth)
+                    if newHealth <= 60 then
+                        goldWaiting = false
+                        connection:Disconnect()
+                    end
+                end)
+                return
+            end
+        elseif goldWaiting then
+            bv.Velocity = Vector3.zero
+            if tick() - goldWaitStart > 10 then
+                goldWaiting = false
+            end
+            return
+        end
+    end
+
+    index += 1
+    if index > #waypoints then index = 1 end
+    return
+end
+
+	local dir = dist > 0 and delta.Unit or Vector3.zero
+
+
+local speed = getCurrentSpeed()
+local desiredVel = dir * speed
+local heightDiff = target.Y - pos.Y
+if heightDiff > 0 then
+	desiredVel += Vector3.new(
+		0,
+		math.clamp(heightDiff * 1.3, 0, 13),
+		0
+	)
+end
+
+bv.Velocity = bv.Velocity:Lerp(desiredVel, LERP_ALPHA)
+
+end)
+
+spawn(function()
+	while true do
+		task.wait(300)
+		deleteUnwantedObjects()
+	end
+end)
